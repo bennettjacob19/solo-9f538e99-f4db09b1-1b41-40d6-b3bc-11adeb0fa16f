@@ -23,6 +23,14 @@ service = ReshardService(DATA_DIR)
 ensure_samples(service.old)
 
 
+def _is_inside(path: Path, root: Path) -> bool:
+    try:
+        Path(path).resolve().relative_to(Path(root).resolve())
+        return True
+    except ValueError:
+        return False
+
+
 def create_app() -> Flask:
     app = Flask(__name__)
     app.secret_key = os.environ.get("SECRET_KEY", "reshard-demo-secret")
@@ -31,6 +39,7 @@ def create_app() -> Flask:
     def index():
         pub = service.new.published
         readable = service.published_readable()
+        history = list(reversed(service.new.history))
         return render_template(
             "index.html",
             old=service.old.status(),
@@ -39,7 +48,8 @@ def create_app() -> Flask:
             published=pub,
             readable=readable,
             usage=service.new.usage_bytes(),
-            history=list(reversed(service.new.history)),
+            history=history,
+            last_op=history[0] if history else None,
         )
 
     @app.post("/mount")
@@ -79,15 +89,24 @@ def create_app() -> Flask:
             simulate_write_fail=request.form.get("simulate_write_fail") == "on",
         )
         if result["status"] == "published":
+            body = result["source_body_bytes"]
+            read = result["source_body_bytes_read"]
+            ratio = f"{read / body:.2f}x" if body else "—"
             flash(
                 f"发布成功 {result['publish_id']}：{n_new} 个新分片，"
                 f"训练步 {result['step']}，本次峰值 {result['op_peak']} B"
                 f"（上一套 {result['prev_published_bytes']} B + "
-                f"本次暂存 {result['staged_bytes']} B）。",
+                f"本次暂存 {result['staged_bytes']} B）；"
+                f"本次实际读取源数组正文 {read} B"
+                f"（源正文 {body} B，{ratio}，含回读校验的重复读取）。",
                 "ok",
             )
         else:
-            flash(f"重分片失败：{result['reason']}。已保留上次发布结果。", "err")
+            flash(
+                f"重分片失败：{result['reason']}。已保留上次发布结果。"
+                f"本次实际读取源数组正文 {result['source_body_bytes_read']} B。",
+                "err",
+            )
         return redirect("/")
 
     @app.get("/download/<int:rank>")
@@ -99,8 +118,9 @@ def create_app() -> Flask:
             abort(409, description="结果依赖旧卷，旧卷未挂载（或挂载了不同的卷），当前不可读")
         if not 0 <= rank < int(pub["ranks"]):
             abort(404, description=f"rank {rank} 超出范围")
-        path = service.new.published_root / pub["id"] / f"rank_{rank}.npz"
-        if not path.is_file():
+        root = service.new.published_root / pub["id"]
+        path = root / f"rank_{rank}.npz"
+        if not _is_inside(path, root) or not path.is_file():
             abort(404, description="分片文件缺失")
         return send_file(path, as_attachment=True,
                          download_name=f"{pub['id']}_rank_{rank}.npz")

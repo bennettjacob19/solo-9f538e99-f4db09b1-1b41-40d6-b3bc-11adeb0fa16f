@@ -3,9 +3,10 @@
 - 旧卷：目录模拟，可卸载 / 挂回。只有挂回同一卷（volume id 相同）才可读。
 - 新卷：published/（当前发布的一套）+ staging/（本次暂存）。
   容量按字节限制，上一套发布与本次暂存都计入占用；记录分片文件占用峰值。
-- 发布流程：读源 -> 校验（缺片 / 训练步）-> 重分片 -> 逐片暂存并累计容量
-  -> 在指定挂载条件下回读校验 -> 原子替换发布。
-  任何一步失败：清理暂存、保留上次发布结果、在历史里记录原因。
+- 发布流程：预读源文件头并校验（缺片 / 训练步）-> 校验容量 -> 流式写暂存
+  -> 在指定挂载条件下回读整套暂存并与源逐片核对 -> 原子替换发布。
+  任何一步失败：清理暂存、保留上次发布结果、在历史里记录原因，并记录
+  本次实际读取的源数组正文字节数。
 """
 from __future__ import annotations
 
@@ -16,10 +17,10 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from reshard import (ARRAY_KEYS, OverCapacityError, ReshardError,
-                     SimulatedWriteError, SourceUnreadableError, VerifyError,
-                     load_source_checkpoint, reshard_arrays, split_sizes,
-                     verify_shards, write_shard)
+from reshard import (MissingShardError, OverCapacityError, ReshardError,
+                     SourceBodyCounter, SourceUnreadableError, VerifyError,
+                     inspect_source_checkpoint, split_sizes,
+                     verify_staging_streaming, write_shards_streaming)
 
 
 def _now() -> str:
@@ -236,14 +237,17 @@ class ReshardService:
                 "capacity": capacity,
                 "can_mount_old": can_mount_old,
                 "simulate_write_fail": simulate_write_fail,
+                "source_body_bytes_read": 0,
             }
             staging_dir = self.new.new_staging_dir()
+            counter = SourceBodyCounter()
             try:
                 if capacity < 0:
                     raise ReshardError("新卷容量必须 >= 0")
                 self.new.set_capacity(capacity)
                 op.update(self._do_run(ckpt_id, n_new, can_mount_old,
-                                       simulate_write_fail, staging_dir))
+                                       simulate_write_fail, staging_dir,
+                                       counter))
                 op["status"] = "published"
             except ReshardError as exc:
                 shutil.rmtree(staging_dir, ignore_errors=True)
@@ -253,61 +257,71 @@ class ReshardService:
                 shutil.rmtree(staging_dir, ignore_errors=True)
                 op["status"] = "failed"
                 op["reason"] = f"内部错误: {exc!r}"
+            # 本次实际读取的源数组正文字节数（含回读校验阶段的重复读取）
+            op["source_body_bytes_read"] = counter.body_bytes
             self.new.append_history(op)
             self.new.save()
             return op
 
     def _do_run(self, ckpt_id: str, n_new: int, can_mount_old: bool,
-                simulate_write_fail: bool, staging_dir: Path) -> dict:
+                simulate_write_fail: bool, staging_dir: Path,
+                counter: SourceBodyCounter) -> dict:
         if n_new < 1:
             raise ReshardError("新 rank 数必须 >= 1")
         if not self.old.accessible():
             raise SourceUnreadableError("旧卷未挂载或挂载了不同的卷，源检查点不可读")
+        if (not ckpt_id or "/" in ckpt_id or "\\" in ckpt_id
+                or ckpt_id in (".", "..") or ckpt_id.startswith(".")):
+            raise MissingShardError(f"缺片: 检查点名称非法（{ckpt_id!r}）")
 
-        # 1) 读源 + 校验（缺片 / 训练步不一致 / 段长度）
-        src = load_source_checkpoint(self.old.checkpoints_dir() / ckpt_id)
+        # 1) 预读源文件头 + 训练步（不读数组正文），校验缺片 / 训练步 / 段长度
+        layout = inspect_source_checkpoint(self.old.checkpoints_dir() / ckpt_id)
 
         # 2) 三个数组按同一全局下标连续等分，余数给低 rank
-        shards = {k: reshard_arrays(src.arrays[k], n_new) for k in ARRAY_KEYS}
-        sizes = split_sizes(src.total, n_new)
+        sizes = split_sizes(layout.total, n_new)
 
-        # 3) 逐片暂存；上一套发布 + 本次暂存一起计入容量
+        # 3) 逐片流式暂存；上一套发布 + 本次暂存一起计入容量
         published_before = self.new.published_bytes()
-        staged = 0
-        shard_files: list[Path] = []
-        fail_at = n_new // 2 if simulate_write_fail else -1
-        for r in range(n_new):
-            if r == fail_at:
-                raise SimulatedWriteError(f"模拟写失败: 写入 rank_{r}.npz 时出错")
-            path = staging_dir / f"rank_{r}.npz"
-            staged += write_shard(path, {k: shards[k][r] for k in ARRAY_KEYS}, src.step)
-            shard_files.append(path)
-            if published_before + staged > self.new.capacity:
+
+        def check_capacity(_path: Path) -> None:
+            staged_now = _dir_bytes(staging_dir)
+            if published_before + staged_now > self.new.capacity:
                 raise OverCapacityError(
                     f"新卷容量超限: 上一套发布 {published_before} B + "
-                    f"本次暂存 {staged} B > 容量 {self.new.capacity} B"
+                    f"本次暂存 {staged_now} B > 容量 {self.new.capacity} B"
                 )
 
-        # 4) 在指定挂载条件下回读校验全套分片，可读才发布
+        write_shards_streaming(
+            staging_dir, layout, sizes,
+            simulate_write_fail=simulate_write_fail,
+            counter=counter, member_done=check_capacity,
+        )
+
+        # 4) 在指定挂载条件下回读整套暂存，逐片与源核对；
+        #    回读途中源被卸载同样视为失败。
         old_st = self.old.status()
         if can_mount_old and not old_st["accessible"]:
             raise VerifyError("声明续训时可挂旧卷，但旧卷当前不可读，"
                               "无法在指定挂载条件下验证全套分片")
-        verify_shards(shard_files, sizes, src.step, src)
+        verify_staging_streaming(staging_dir, layout, sizes, counter=counter)
+        if not self.old.accessible():
+            raise VerifyError("回读校验期间旧卷变为不可读，无法确认与源一致")
 
         # 5) 发布：记录峰值（上一套 + 本次暂存），原子替换
+        staged = _dir_bytes(staging_dir)
         op_peak = published_before + staged
         self.new.record_peak(op_peak)
         pub_id = f"pub-{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
         record = {
             "id": pub_id,
-            "source_ckpt": src.ckpt_id,
-            "step": src.step,
+            "source_ckpt": layout.ckpt_id,
+            "step": layout.step,
             "ranks": n_new,
-            "total_elems": src.total,
-            "dtype": src.dtype,
+            "total_elems": layout.total,
+            "dtype": str(layout.dtype),
             "shard_sizes": sizes,
             "bytes": staged,
+            "source_body_bytes_read": counter.body_bytes,
             "requires_old_volume": bool(can_mount_old),
             "old_volume_id": old_st["volume_id"] if can_mount_old else None,
             "created_at": _now(),
@@ -316,9 +330,10 @@ class ReshardService:
         self.new.record_peak(self.new.published_bytes())
         return {
             "publish_id": pub_id,
-            "step": src.step,
+            "step": layout.step,
             "shard_sizes": sizes,
             "staged_bytes": staged,
             "prev_published_bytes": published_before,
             "op_peak": op_peak,
+            "source_body_bytes": layout.body_bytes,
         }

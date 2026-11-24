@@ -126,6 +126,12 @@
         <span class="hint">（发布 {{ new.published_bytes() }} B + 暂存 {{ new.staging_bytes() }} B）</span>
       </div>
       <div><b>分片文件占用峰值</b> <span class="mono">{{ new.peak_bytes }} B</span></div>
+      <div><b>最近一次源正文读取</b>
+        {% if last_op %}
+        <span class="mono">{{ last_op.get('source_body_bytes_read', '—') }} B</span>
+        <span class="hint">（{{ '发布成功' if last_op.status == 'published' else '失败' }}，含回读校验的重复读取；上限为源正文的两倍）</span>
+        {% else %}<span class="hint">尚未执行重分片</span>{% endif %}
+      </div>
     </div>
     <div class="kv" style="flex:2; min-width:320px;">
       {% if published %}
@@ -140,6 +146,7 @@
         {% if readable %}<span class="badge b-ok">可读</span>
         {% else %}<span class="badge b-err">不可读（旧卷已卸载或卷 ID 不符）</span>{% endif %}
       </div>
+      <div><b>本次读取源正文</b> <span class="mono">{{ published.get('source_body_bytes_read', '—') }} B</span></div>
       <div><b>按新 rank 下载</b>
         {% for r in range(published.ranks) %}
           {% if readable %}
@@ -159,7 +166,7 @@
 <section class="card">
   <h2>④ 操作历史（最近 50 条）</h2>
   <table>
-    <tr><th>时间</th><th>检查点</th><th>新 rank</th><th>容量 B</th><th>依赖旧卷</th><th>结果</th><th>峰值 B / 失败原因</th></tr>
+    <tr><th>时间</th><th>检查点</th><th>新 rank</th><th>容量 B</th><th>依赖旧卷</th><th>结果</th><th>峰值 B / 失败原因</th><th>读源正文 B</th></tr>
     {% for h in history %}
     <tr>
       <td class="mono">{{ h.time }}</td>
@@ -170,6 +177,7 @@
       <td>{% if h.status == 'published' %}<span class="badge b-ok">已发布</span>
           {% else %}<span class="badge b-err">失败，保留上次发布</span>{% endif %}</td>
       <td>{% if h.status == 'published' %}{{ h.op_peak }}{% else %}{{ h.reason }}{% endif %}</td>
+      <td class="mono">{{ h.get('source_body_bytes_read', '—') }}</td>
     </tr>
     {% endfor %}
   </table>
