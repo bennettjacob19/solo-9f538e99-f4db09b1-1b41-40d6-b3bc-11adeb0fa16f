@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>检查点重分片</title>
+<style>
+  :root { --ok:#1a7f37; --warn:#9a6700; --err:#cf222e; --line:#d0d7de; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin: 0; background: #f6f8fa; color: #1f2328; }
+  header { background: #24292f; color: #fff; padding: 14px 24px; }
+  header h1 { margin: 0; font-size: 18px; }
+  main { max-width: 1080px; margin: 20px auto; padding: 0 16px; display: grid; gap: 16px; }
+  .card { background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 16px 20px; }
+  .card h2 { margin: 0 0 12px; font-size: 15px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { border: 1px solid var(--line); padding: 6px 10px; text-align: left; }
+  th { background: #f6f8fa; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; font-weight: 600; }
+  .b-ok { background: #dafbe1; color: var(--ok); }
+  .b-warn { background: #fff8c5; color: var(--warn); }
+  .b-err { background: #ffebe9; color: var(--err); }
+  .flash { padding: 10px 14px; border-radius: 6px; font-size: 14px; }
+  .f-ok { background: #dafbe1; border: 1px solid var(--ok); }
+  .f-warn { background: #fff8c5; border: 1px solid var(--warn); }
+  .f-err { background: #ffebe9; border: 1px solid var(--err); }
+  button, .btn { font-size: 13px; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--line);
+                 background: #f6f8fa; cursor: pointer; text-decoration: none; color: inherit; display: inline-block; }
+  button.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+  button:disabled, .btn.disabled { opacity: .45; cursor: not-allowed; }
+  form.inline { display: inline; }
+  label { font-size: 13px; display: block; margin: 8px 0 2px; }
+  input[type=number], select { font-size: 13px; padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; width: 220px; }
+  .row { display: flex; gap: 24px; flex-wrap: wrap; }
+  .kv { font-size: 13px; line-height: 1.9; }
+  .kv b { display: inline-block; min-width: 130px; color: #57606a; font-weight: 600; }
+  .hint { color: #57606a; font-size: 12px; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+</style>
+</head>
+<body>
+<header><h1>训练机换卡 · 检查点重分片（Flask + NumPy）</h1></header>
+<main>
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% for cat, msg in messages %}
+    <div class="flash f-{{ cat }}">{{ msg }}</div>
+  {% endfor %}
+{% endwith %}
+
+<div class="row">
+  <section class="card" style="flex:1; min-width:320px;">
+    <h2>① 旧卷状态（源检查点）</h2>
+    <div class="kv">
+      <div><b>挂载状态</b>
+        {% if old.mounted %}<span class="badge b-ok">已挂载</span>
+        {% else %}<span class="badge b-err">已卸载</span>{% endif %}
+      </div>
+      <div><b>当前卷 ID</b> <span class="mono">{{ old.volume_id or '—' }}</span></div>
+      <div><b>内置样例卷 ID</b> <span class="mono">{{ old.stored_id or '—' }}</span></div>
+      <div><b>旧卷可读</b>
+        {% if old.accessible %}<span class="badge b-ok">可读</span>
+        {% else %}<span class="badge b-err">不可读</span>{% endif %}
+      </div>
+    </div>
+    <p>
+      <form class="inline" method="post" action="/mount">
+        <input type="hidden" name="action" value="unmount">
+        <button type="submit" {% if not old.mounted %}disabled{% endif %}>模拟卸载</button>
+      </form>
+      <form class="inline" method="post" action="/mount">
+        <input type="hidden" name="action" value="mount_same">
+        <button type="submit">挂回同一卷</button>
+      </form>
+      <form class="inline" method="post" action="/mount">
+        <input type="hidden" name="action" value="mount_other">
+        <button type="submit">挂载不同卷（演示）</button>
+      </form>
+    </p>
+    {% if checkpoints is none %}
+      <p class="hint">旧卷不可读，检查点列表不可用。</p>
+    {% else %}
+    <table>
+      <tr><th>检查点</th><th>rank 数</th><th>训练步</th><th>各 rank 长度</th><th>dtype</th></tr>
+      {% for c in checkpoints %}
+      <tr>
+        <td class="mono">{{ c.ckpt_id }}</td>
+        <td>{{ c.ranks }}</td>
+        <td>{{ c.step }}</td>
+        <td>{{ c.lengths }}</td>
+        <td>{{ c.dtype }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% endif %}
+  </section>
+
+  <section class="card" style="flex:1; min-width:320px;">
+    <h2>② 重分片</h2>
+    <form method="post" action="/reshard">
+      <label>选择检查点</label>
+      <select name="ckpt_id" {% if checkpoints is none %}disabled{% endif %}>
+        {% for c in checkpoints or [] %}
+        <option value="{{ c.ckpt_id }}">{{ c.ckpt_id }}</option>
+        {% endfor %}
+      </select>
+      <label>新 rank 数</label>
+      <input type="number" name="n_new" min="1" value="5" required>
+      <label>新卷容量（字节）</label>
+      <input type="number" name="capacity" min="0" value="{{ new.capacity }}" required>
+      <label><input type="checkbox" name="can_mount_old" style="width:auto;"> 续训时可挂旧卷（勾选则发布结果依赖旧卷）</label>
+      <label><input type="checkbox" name="simulate_write_fail" style="width:auto;"> 模拟写失败（演示失败保留旧发布）</label>
+      <p><button class="primary" type="submit" {% if checkpoints is none %}disabled{% endif %}>开始重分片并发布</button></p>
+      <p class="hint">三个数组（param / adam_m / adam_v）按同一全局下标连续等分，余数给低 rank；每片带训练步。上一套发布与本次暂存都计入容量。</p>
+    </form>
+  </section>
+</div>
+
+<section class="card">
+  <h2>③ 新卷与当前发布</h2>
+  <div class="row">
+    <div class="kv" style="flex:1; min-width:280px;">
+      <div><b>容量</b> {{ new.capacity }} B</div>
+      <div><b>当前占用</b> {{ usage }} B
+        {% if usage > new.capacity %}<span class="badge b-err">超容量</span>{% endif %}
+        <span class="hint">（发布 {{ new.published_bytes() }} B + 暂存 {{ new.staging_bytes() }} B）</span>
+      </div>
+      <div><b>分片文件占用峰值</b> <span class="mono">{{ new.peak_bytes }} B</span></div>
+    </div>
+    <div class="kv" style="flex:2; min-width:320px;">
+      {% if published %}
+      <div><b>发布 ID</b> <span class="mono">{{ published.id }}</span></div>
+      <div><b>来源 / 训练步</b> {{ published.source_ckpt }} / step {{ published.step }}</div>
+      <div><b>新 rank 数</b> {{ published.ranks }}　<b>各片长度</b> {{ published.shard_sizes }}</div>
+      <div><b>依赖旧卷</b>
+        {% if published.requires_old_volume %}<span class="badge b-warn">是（续训需挂旧卷 {{ published.old_volume_id }}）</span>
+        {% else %}<span class="badge b-ok">否</span>{% endif %}
+      </div>
+      <div><b>当前可读性</b>
+        {% if readable %}<span class="badge b-ok">可读</span>
+        {% else %}<span class="badge b-err">不可读（旧卷已卸载或卷 ID 不符）</span>{% endif %}
+      </div>
+      <div><b>按新 rank 下载</b>
+        {% for r in range(published.ranks) %}
+          {% if readable %}
+          <a class="btn" href="/download/{{ r }}">rank_{{ r }}.npz</a>
+          {% else %}
+          <span class="btn disabled">rank_{{ r }}.npz</span>
+          {% endif %}
+        {% endfor %}
+      </div>
+      {% else %}
+      <p class="hint">尚未发布任何结果。</p>
+      {% endif %}
+    </div>
+  </div>
+</section>
+
+<section class="card">
+  <h2>④ 操作历史（最近 50 条）</h2>
+  <table>
+    <tr><th>时间</th><th>检查点</th><th>新 rank</th><th>容量 B</th><th>依赖旧卷</th><th>结果</th><th>峰值 B / 失败原因</th></tr>
+    {% for h in history %}
+    <tr>
+      <td class="mono">{{ h.time }}</td>
+      <td class="mono">{{ h.ckpt_id }}</td>
+      <td>{{ h.n_new }}</td>
+      <td>{{ h.capacity }}</td>
+      <td>{{ '是' if h.can_mount_old else '否' }}{{ '，模拟写失败' if h.simulate_write_fail }}</td>
+      <td>{% if h.status == 'published' %}<span class="badge b-ok">已发布</span>
+          {% else %}<span class="badge b-err">失败，保留上次发布</span>{% endif %}</td>
+      <td>{% if h.status == 'published' %}{{ h.op_peak }}{% else %}{{ h.reason }}{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</section>
+
+</main>
+</body>
+</html>

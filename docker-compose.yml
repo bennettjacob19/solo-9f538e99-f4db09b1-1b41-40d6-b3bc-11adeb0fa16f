@@ -1,0 +1,16 @@
+services:
+  resharder:
+    build: ./app
+    image: ckpt-resharder:latest
+    container_name: ckpt-resharder
+    ports:
+      - "8000:8000"
+    environment:
+      DATA_DIR: /data
+      PORT: "8000"
+    volumes:
+      - reshard-data:/data
+    restart: unless-stopped
+
+volumes:
+  reshard-data:
